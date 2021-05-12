@@ -101,8 +101,7 @@ GRead(n) ==  \* Execute a read
     /\ UNCHANGED <<msgs, nodeTS, nodeState, nodeRcvedAcks, nodeLastWriteTS>>
               
 GWrite(n) == \* Execute a write
-    \* writes in invalid state are also supported as an optimization
-    /\  nodeState[n]      \in {"valid"}
+    /\  nodeState[n] = "valid"
     /\  nodeTS[n].version < G_MAX_VERSION \* Only to configurably terminate the model checking 
     /\  g_actions_for_upd(n, nodeTS[n].version + 1, n, "write", {})
 
