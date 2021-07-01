@@ -1,17 +1,24 @@
 ------------------------------- MODULE Galene -------------------------------
 \* Galene: is a linearizable protocol used in ccKVS of Scale-out ccNUMA [Eurosys'18]
+\* This spec actually includes two variants of Galene one that does not accepts 
+\* concurrent writes (SWMR) but allows for read-modify-writes and 
+\* the one actually used in the paper that permits concurrent writes (MWMR).
+\* Setting the constant enableMWMR TRUE or FALSE verifies either variant accordingly.
 
 EXTENDS     Integers,
             FiniteSets
 
 CONSTANTS   G_NODES,
-            G_MAX_VERSION
+            G_MAX_VERSION,
+            enableMWMR
             
 VARIABLES   msgs,
             nodeTS,
             nodeState, 
             nodeRcvedAcks
             
+ASSUME enableMWMR \in {TRUE, FALSE}
+
 \* all Galene (+ environment) variables
 gvars == << msgs, nodeTS, nodeState, nodeRcvedAcks>>
 -------------------------------------------------------------------------------------
@@ -38,8 +45,8 @@ GMessage ==  \* Messages exchanged by Galene
                            version   : 0..G_MAX_VERSION,  
                            tieBreaker: G_NODES] 
         \union
-    \* We do not send the Value w/ VALs (TS suffices to check consistency)
-    [type: {"VAL"},        version   : 0..G_MAX_VERSION, 
+    \* We do not send the Value w/ UPDs (TS suffices to check consistency)
+    [type: {"UPD"},        version   : 0..G_MAX_VERSION, 
                            tieBreaker: G_NODES] 
 
 GTypeOK ==  \* The type correctness invariant
@@ -47,7 +54,7 @@ GTypeOK ==  \* The type correctness invariant
     /\ \A n \in G_NODES: nodeRcvedAcks[n] \subseteq (G_NODES \ {n})
     /\ nodeTS              \in [G_NODES -> [version   : 0..G_MAX_VERSION,
                                             tieBreaker: G_NODES         ]]
-    /\ nodeState           \in [G_NODES -> {"valid", "invalid", "write"}]
+    /\ nodeState           \in [G_NODES -> {"valid", "invalid", "write"}] 
             
                                               
 
@@ -58,10 +65,11 @@ GConsistent ==
                         \/ nodeTS[s]    = nodeTS[k]
                                               
 GSWMR ==  \* veryfying exactly one write is committed per version
-    \A m,l \in msgs : \/ m.type    # "VAL"
-                      \/ l.type    # "VAL"
-                      \/ m.version # l.version
-                      \/ m.tieBreaker = l.tieBreaker
+    \/ enableMWMR
+    \/ \A m,l \in msgs : \/ m.type    # "UPD"
+                         \/ l.type    # "UPD"
+                         \/ m.version # l.version
+                         \/ m.tieBreaker = l.tieBreaker
 
 
 GInit == \* The initial predicate
@@ -72,6 +80,7 @@ GInit == \* The initial predicate
                                                  tieBreaker |-> 
                                                    CHOOSE k \in G_NODES: 
                                                    \A m \in G_NODES: k <= m]]
+
 -------------------------------------------------------------------------------------
 
 g_actions_for_upd(n, newVersion, newTieBreaker, newState, newAcks) == 
@@ -109,10 +118,10 @@ GRcvAck(n) ==   \* Process received Ack
         /\ UNCHANGED <<msgs, nodeTS, nodeState>>
 
 
-GSendVals(n) == \* Send validations once acknowledments from all nodes are received 
+GSendUpds(n) == \* Send validations once acknowledments from all nodes are received 
     /\ receivedAllAcks(n)
     /\ nodeState[n] = "write"
-    /\ send([type        |-> "VAL", 
+    /\ send([type        |-> "UPD", 
              version     |-> nodeTS[n].version, 
              tieBreaker  |-> nodeTS[n].tieBreaker])
     /\ nodeState'   = [nodeState EXCEPT![n] = "valid"]
@@ -122,27 +131,51 @@ GCoordinatorActions(n) ==   \* Coordinator actions for reads or writes
     \/ GRead(n)          
     \/ GWrite(n)         
     \/ GRcvAck(n)
-    \/ GSendVals(n) 
+    \/ GSendUpds(n) 
 -------------------------------------------------------------------------------------               
     
-GRcvInv(n, m) ==  \* Process received invalidation iff greater ts
-        /\ m.type     = "INV"
-        /\ m.sender   # n
+ACK_already_send(n, m) == \* only to keep the state space small (we do not re-send ACKs previously sent)
+    \E k \in msgs:
+        /\ k.type       = "ACK"
+        /\ k.sender     = n 
+        /\ k.version    = m.version
+        /\ k.tieBreaker = m.tieBreaker
+
+
+GRcvInvSWMR(n, m) ==  \* apply and respond to invalidation iff greater ts 
         /\ greaterTS(m.version, m.tieBreaker,
-                     nodeTS[n].version, 
-                     nodeTS[n].tieBreaker)
+                       nodeTS[n].version, 
+                       nodeTS[n].tieBreaker)
         /\ send([type       |-> "ACK",
                  sender     |-> n,   
                  version    |-> m.version,
                  tieBreaker |-> m.tieBreaker])
         /\ nodeState' = [nodeState EXCEPT ![n] = "invalid"]
         /\ nodeTS'    = [nodeTS    EXCEPT ![n].version    = m.version,
-                                          ![n].tieBreaker = m.tieBreaker]
+                                                  ![n].tieBreaker = m.tieBreaker]
         /\ UNCHANGED <<nodeRcvedAcks>>
+ 
+GRcvInvMWMR(n, m) ==  \* (if MWMR is enabled) send an ACK even if not greater ts 
+        /\ enableMWMR = TRUE
+        /\ ~greaterTS(m.version, m.tieBreaker,
+                       nodeTS[n].version, 
+                       nodeTS[n].tieBreaker)
+        /\ ~ACK_already_send(n, m)
+        /\ send([type       |-> "ACK",
+                 sender     |-> n,   
+                 version    |-> m.version,
+                 tieBreaker |-> m.tieBreaker])
+        /\ UNCHANGED <<nodeRcvedAcks, nodeTS, nodeState>>
      
+GRcvInv(n, m) ==
+        /\ m.type     = "INV"
+        /\ m.sender   # n
+        /\ \/ GRcvInvSWMR(n, m)
+           \/ GRcvInvMWMR(n, m)
+
             
-GRcvVal(n, m) ==   \* Process received validation iff same ts
-        /\ m.type       = "VAL"
+GRcvUpd(n, m) ==   \* Process received validation iff same ts
+        /\ m.type       = "UPD"
         /\ nodeState[n] # "valid"
         /\ equalTS(m.version, m.tieBreaker,
                    nodeTS[n].version, 
@@ -153,7 +186,7 @@ GRcvVal(n, m) ==   \* Process received validation iff same ts
 GFollowerActions(n) ==  \* Follower actions for writes 
     \E m \in msgs: 
         \/ GRcvInv(n, m)
-        \/ GRcvVal(n, m) 
+        \/ GRcvUpd(n, m) 
 ------------------------------------------------------------------------------------- 
 
 GNext == 
